@@ -1,5 +1,6 @@
 # Ricer for NixOS
 
+This script only works for NixOS systems, for non-nixos setups, use the original repository.
 Original repository - https://github.com/ezequielgk/Ricer
 
 A CLI script to apply color palettes to wallpapers using [lutgen](https://github.com/ozwaldorf/lutgen-rs).

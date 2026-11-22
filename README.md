@@ -157,3 +157,17 @@ The default live palette is `Live.json`. It can be renamed from the menu. A stam
 
 - Images with very few unique colors can cause `recol` to fail. The script retries using an FFmpeg JPEG re-encode and, when necessary, added noise.
 - The first use of either Noctalia script may take longer because `recol` is compiled once. Subsequent runs use the cached executable.
+
+## Uninstallation
+
+To completely remove Ricer, its installed scripts, and the cached `recol` binary, run:
+
+```bash
+rm -f ~/.local/bin/ricer \
+      ~/.local/bin/noctalia-ricer \
+      ~/.local/bin/wallpaper-to-noctalia
+
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/noctalia-ricer"
+```
+
+This removes the three installed scripts and the cached `recol` installation. It does not remove your existing Noctalia palettes or other configuration files.

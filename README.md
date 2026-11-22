@@ -161,7 +161,9 @@ The default live palette is `Live.json`. It can be renamed from the menu. A stam
 
 ## Uninstallation
 
-To completely remove Ricer, its installed scripts, and the cached `recol` binary, run:
+To remove Ricer, its installed scripts, and the cached `recol` installation, run the commands for your shell.
+
+**Bash:**
 
 ```bash
 rm -f ~/.local/bin/ricer \
@@ -169,6 +171,20 @@ rm -f ~/.local/bin/ricer \
       ~/.local/bin/wallpaper-to-noctalia
 
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/noctalia-ricer"
+```
+
+**Fish:**
+
+```fish
+rm -f ~/.local/bin/ricer \
+      ~/.local/bin/noctalia-ricer \
+      ~/.local/bin/wallpaper-to-noctalia
+
+set data_dir ~/.local/share
+if set -q XDG_DATA_HOME
+    set data_dir $XDG_DATA_HOME
+end
+rm -rf $data_dir/noctalia-ricer
 ```
 
 This removes the three installed scripts and the cached `recol` installation. It does not remove your existing Noctalia palettes or other configuration files.

@@ -1,0 +1,1443 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i bash -p bash coreutils findutils gnugrep gnused util-linux fzf chafa ffmpeg jq python3 cargo rustc git gcc
+
+# /*
+#  * NOCTALIA RICER (recol edition)
+#  * Author: basado en LUTGEN RICER (Ezequiel/Zeke, Mikuri12)
+#  *
+#  * Mismo flujo que ricer, pero genera palettes de Noctalia
+#  * desde wallpapers usando recol (ffmpeg palettegen).
+#  * Flow managed via state machine to allow backtracking (ESC).
+#  */
+
+C_BLUE="\e[1;34m"; C_GREEN="\e[1;32m"; C_RED="\e[1;31m"; C_YELLOW="\e[1;33m"; C_CYAN="\e[1;36m"; C_RESET="\e[0m"
+
+PALETTES_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/noctalia/palettes"
+WALLPAPER_DIR="${WALLPAPER_DIR:-$HOME/Imágenes/Wallpapers}"
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/noctalia-ricer"
+STAMPS_DIR="$CACHE_DIR/stamps"
+MAX_JOBS="${MAX_JOBS:-4}"
+
+# recol is built on first use and kept outside the Nix store so subsequent
+# launches do not rebuild it. The Nix shell supplies Cargo, Rust and Git.
+RECOL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/noctalia-ricer/recol"
+export PATH="$RECOL_ROOT/bin:$PATH"
+
+ensure_recol() {
+    command -v recol >/dev/null 2>&1 && return 0
+
+    if ! command -v cargo >/dev/null 2>&1 || ! command -v git >/dev/null 2>&1; then
+        echo -e "${C_RED}[ERROR] Cargo and Git are required to install recol.${C_RESET}" >&2
+        return 1
+    fi
+
+    echo -e "${C_CYAN}[INFO] recol is missing; building it once from the upstream repository...${C_RESET}"
+    mkdir -p "$RECOL_ROOT"
+    cargo install --git https://github.com/nlkli/recol --branch main --root "$RECOL_ROOT"
+}
+
+CONFIG_FILE="$HOME/.config/noctalia-ricer.conf"
+CONFIG_NAME="noctalia-ricer.conf"
+
+# Live palette: hook de Noctalia que regenera la palette al cambiar el wallpaper
+LIVE_PALETTE_NAME="Live"
+HOOKS_CONF="$HOME/.config/noctalia/config.toml"
+HOOK_SCRIPT="$HOME/.config/noctalia/hooks/live-palette.sh"
+
+# Ajustes recol (defaults: sin cambios)
+SATURATION="0"
+CONTRAST="0"
+BRIGHTNESS="0"
+TEMPERATURE="0"
+TINT="0"
+VIBRANCE="0"
+HUE="0"
+NORMALIZE="0"
+EXTRA_SPEC=""
+
+VARIANT="Both"
+CUSTOM_NAME=""
+
+ADJUST_SPEC=""
+SELECTED_FILES=()
+SAMPLE_WALLPAPER=""
+
+IMG_PATTERN=(-iname "*.jpg" -o -iname "*.jpeg" -o -iname "*.png" -o -iname "*.webp" -o -iname "*.gif")
+
+export FZF_DEFAULT_OPTS="--layout=reverse --border=rounded --info=inline --prompt='❯ '"
+
+mkdir -p "$PALETTES_DIR"
+
+PREVIEW_SCRIPT=$(mktemp)
+LIVE_PREVIEW_SCRIPT=$(mktemp)
+CONVERT_SCRIPT=$(mktemp)
+trap 'rm -f "$PREVIEW_SCRIPT" "$LIVE_PREVIEW_SCRIPT" "$CONVERT_SCRIPT"' EXIT SIGINT SIGTERM
+
+# /*
+#  * CONVERT: recol JSON -> palette Noctalia (Material Design 3 + terminal)
+#  */
+cat << 'EOF' > "$CONVERT_SCRIPT"
+#!/usr/bin/env python3
+"""Noctalia palette builder.
+Usage: conv.py <dark_theme.json> [light_theme.json]
+
+dark:  recol -m IMG --json (o con -a spec)
+light: recol -m IMG --json -a "invert=50[,spec]"
+
+Si no se pasa light, la variante light se espeja igual a la dark.
+"""
+import json, sys
+
+ANSI = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+ACCENT_KEYS = ("red", "orange", "yellow", "green", "cyan", "blue", "magenta", "pink")
+
+def hex_rgb(h):
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+def rgb_hex(r, g, b):
+    return f"#{max(r,0)&255:02x}{max(g,0)&255:02x}{max(b,0)&255:02x}"
+
+def shade(h, factor):
+    r, g, b = hex_rgb(h)
+    return rgb_hex(int(r * factor), int(g * factor), int(b * factor))
+
+def hue_sat(h):
+    r, g, b = (x / 255 for x in hex_rgb(h))
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx == mn:
+        return -1, 0.0
+    d = mx - mn
+    s = d / mx
+    if mx == r: hd = ((g - b) / d) % 6
+    elif mx == g: hd = (b - r) / d + 2
+    else: hd = (r - g) / d + 4
+    return (hd * 60) % 360, s
+
+def hue_dist(a, b):
+    if a < 0 or b < 0:
+        return 180
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+def pick_accents(c):
+    """Primary/secundario/terciario: ANSI mas cromaticos con hue distinto.
+    Fallback: cursor.bg si la imagen es esencialmente gris."""
+    base = c["base"]
+    seen, scored = set(), []
+    for k in ACCENT_KEYS:
+        h = base[k]
+        if h not in seen:
+            seen.add(h)
+            scored.append(h)
+    scored.sort(key=lambda h: hue_sat(h)[1], reverse=True)
+
+    primario = c["cursor"]["bg"]
+    p_h, p_s = hue_sat(primario)
+    if scored and hue_sat(scored[0])[1] > max(p_s, 0.12):
+        primario = scored[0]
+        p_h, _ = hue_sat(primario)
+
+    pool = [h for h in scored if h != primario]
+    sec = next((h for h in pool if hue_dist(hue_sat(h)[0], p_h) > 40), None)
+    if sec is None:
+        sec = pool[0] if pool else base["cyan"]
+    s_h = hue_sat(sec)[0]
+
+    pool2 = [h for h in pool if h != sec]
+    ter = next((h for h in pool2 if hue_dist(hue_sat(h)[0], p_h) > 40
+                and hue_dist(hue_sat(h)[0], s_h) > 40), None)
+    if ter is None:
+        ter = pool2[0] if pool2 else sec
+    return primario, sec, ter
+
+def lum_hex(h):
+    """Luminancia relativa (WCAG) de un hex."""
+    def lin(x):
+        x /= 255.0
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    r, g, b = hex_rgb(h)
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+def contrast(a, b):
+    la, lb = lum_hex(a), lum_hex(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+def ensure_contrast(fg, bg, target=3.0):
+    """Ajusta el fondo (acento) hasta que el par on_x/x alcance el ratio.
+    Igual que el check de CI (floor 2.0, warn <3.0): apuntamos a >=3.0."""
+    if contrast(fg, bg) >= target:
+        return bg
+    factor = 1.06 if lum_hex(fg) < lum_hex(bg) else 0.94
+    for _ in range(60):
+        bg = shade(bg, factor)
+        if contrast(fg, bg) >= target:
+            return bg
+    return bg
+
+# Piso de luminancia del fondo dark: evita fondos casi negro en wallpapers
+# oscuros (estilo Cafecito/Noir, ~luma de #171717).
+MIN_DARK_LUM = 0.0085
+
+def dark_surface(bg):
+    """Fondo dark: bg[1] (el tono que usaba el shell, mas claro que bg[0]).
+    Si es casi negro se mezcla hacia bg[2] hasta el piso de luminancia.
+    mSurface y terminal.background comparten este mismo color."""
+    s, hi = bg[1], bg[2]
+    l1, l2 = lum_hex(s), lum_hex(hi)
+    if l1 >= MIN_DARK_LUM or l2 <= l1:
+        return s
+    t = min((MIN_DARK_LUM - l1) / (l2 - l1), 0.5)
+    r1, g1, b1 = hex_rgb(s)
+    r2, g2, b2 = hex_rgb(hi)
+    return rgb_hex(int(r1 + (r2 - r1) * t), int(g1 + (g2 - g1) * t),
+                   int(b1 + (b2 - b1) * t))
+
+def build_dark(c):
+    base, bright = c["base"], c["bright"]
+    bg, fg = c["bg"], c["fg"]
+    primario, secundario, terciario = pick_accents(c)
+    superficie = dark_surface(bg)
+    on = bg[0]  # texto sobre acentos (oscuro en dark)
+    primario = ensure_contrast(on, primario)
+    secundario = ensure_contrast(on, secundario)
+    terciario = ensure_contrast(on, terciario)
+    error = ensure_contrast(on, base["red"])
+    hover = ensure_contrast(fg[0], bg[3])
+    return {
+        "primary": primario, "on_primary": on,
+        "secondary": secundario, "on_secondary": on,
+        "tertiary": terciario, "on_tertiary": on,
+        "error": error, "on_error": on,
+        # surface == terminal.background: para apps de terminal el fondo debe
+        # ser identico al del shell (convencion Cafecito/Noir).
+        "surface": superficie, "on_surface": fg[0],
+        "surface_container": bg[2], "on_surface_variant": fg[0],
+        "outline_variant": bg[4], "shadow": shade(bg[0], 0.6),
+        "hover": hover, "on_hover": fg[0],
+        "terminal": {
+            "normal": {k: base[k] for k in ANSI},
+            "bright": {k: bright[k] for k in ANSI},
+            "foreground": fg[0], "background": superficie,
+            "selection_fg": bg[0], "selection_bg": primario,
+            "cursor_text": bg[0], "cursor": fg[0],
+        },
+    }
+
+def build_light(dark_c, light_c):
+    # Superficies y fg: del tema invertido de recol (conserva el tinte del wallpaper)
+    s0, s1, s2, s4 = (light_c["bg"][0], light_c["bg"][1],
+                      light_c["bg"][2], light_c["bg"][4])
+    fg0 = light_c["fg"][0]
+    # Acentos: del tema dark, oscurecidos (convencion Cafecito ~x0.78-0.90)
+    primario, secundario, terciario = pick_accents(dark_c)
+    primario, secundario = shade(primario, 0.9), shade(secundario, 0.85)
+    terciario, error = shade(terciario, 0.85), shade(dark_c["base"]["red"], 0.82)
+    # asegurar on_x legible sobre cada acento (CI: floor 2.0, warn <3.0)
+    primario = ensure_contrast(s0, primario)
+    secundario = ensure_contrast(s0, secundario)
+    terciario = ensure_contrast(s0, terciario)
+    error = ensure_contrast(s0, error)
+    return {
+        "primary": primario, "on_primary": s0,
+        "secondary": secundario, "on_secondary": s0,
+        "tertiary": terciario, "on_tertiary": s0,
+        "error": error, "on_error": s0,
+        "surface": s0, "on_surface": fg0,
+        "surface_container": s1, "on_surface_variant": fg0,
+        "outline_variant": s4, "shadow": shade(s4, 0.7),
+        "hover": ensure_contrast(fg0, s2), "on_hover": fg0,
+        "terminal": {
+            "normal": {k: (s4 if k == "black" else
+                           dark_c["bg"][0] if k == "white" else
+                           shade(dark_c["base"][k], 0.78)) for k in ANSI},
+            "bright": {k: (shade(s4, 0.8) if k == "black" else
+                           shade(dark_c["bg"][0], 0.62) if k == "white" else
+                           shade(dark_c["bright"][k], 0.79)) for k in ANSI},
+            "foreground": fg0, "background": s0,
+            "selection_fg": s0, "selection_bg": primario,
+            "cursor_text": s0, "cursor": fg0,
+        },
+    }
+
+def main():
+    with open(sys.argv[1]) as f:
+        dark_c = json.load(f)["colors"]
+    if len(sys.argv) > 2 and sys.argv[2]:
+        with open(sys.argv[2]) as f:
+            light_c = json.load(f)["colors"]
+        light = build_light(dark_c, light_c)
+    else:
+        light = build_dark(dark_c)
+    print(json.dumps({"version": 2, "dark": build_dark(dark_c), "light": light}, indent=2))
+
+if __name__ == "__main__":
+    main()
+EOF
+chmod +x "$CONVERT_SCRIPT"
+
+# /*
+#  * PREVIEW: swatches de un palette guardado (para editar palettes)
+#  */
+cat << 'EOF' > "$PREVIEW_SCRIPT"
+#!/usr/bin/env bash
+file="$1"
+
+swatch_row() {
+    local label="$1"; shift
+    printf "  %-11s" "$label"
+    local hex shown=0
+    for hex in "$@"; do
+        hex="${hex//\#/}"
+        if [[ ${#hex} -eq 6 ]]; then
+            printf "\e[48;2;%d;%d;%dm     \e[0m" \
+                $((16#${hex:0:2})) $((16#${hex:2:2})) $((16#${hex:4:2}))
+            shown=1
+        fi
+    done
+    (( shown )) || printf "\e[2m  (faltan colores)\e[0m"
+    echo ""
+}
+
+if [[ ! -f "$file" ]]; then
+    echo "  [!] Palette no encontrado."
+    exit 0
+fi
+
+name=$(basename "$file" .json)
+echo -e "\e[1;36m󰏘 Palette: $name\e[0m"
+echo ""
+
+if [[ "$(jq -r 'type == "object" and (has("dark") or has("light"))' "$file" 2>/dev/null)" != "true" ]]; then
+    echo -e "  \e[1;33m[!] No es una palette de Noctalia (sin variant dark/light).\e[0m"
+    exit 0
+fi
+
+for variant in dark light; do
+    [[ "$(jq -r "has(\"$variant\")" "$file")" != "true" ]] && continue
+    echo -e "\e[1;35m $variant\e[0m"
+    swatch_row "UI"       $(jq -r ".$variant | .primary // .mPrimary // empty, .secondary // .mSecondary // empty, .tertiary // .mTertiary // empty, .error // .mError // empty" "$file" 2>/dev/null)
+    swatch_row "Surface"  $(jq -r ".$variant | .surface // .mSurface // empty, .surface_container // .mSurfaceVariant // empty, .outline_variant // .mOutline // empty, .hover // .mHover // empty" "$file" 2>/dev/null)
+    swatch_row "Terminal" $(jq -r ".$variant.terminal?.normal? | [.black, .red, .green, .yellow, .blue, .magenta, .cyan, .white] // [] | .[]?" "$file" 2>/dev/null)
+    swatch_row "Bright"   $(jq -r ".$variant.terminal?.bright? | [.black, .red, .green, .yellow, .blue, .magenta, .cyan, .white] // [] | .[]?" "$file" 2>/dev/null)
+    echo ""
+done
+EOF
+chmod +x "$PREVIEW_SCRIPT"
+
+# /*
+#  * LIVE PREVIEW: imagen + swatches del palette en tuning (con cache por stamp)
+#  */
+cat << 'EOF' > "$LIVE_PREVIEW_SCRIPT"
+#!/usr/bin/env bash
+cache_dir="/tmp/noctalia_ricer_preview"
+mkdir -p "$cache_dir"
+
+sample_img="$PREV_IMG"
+adjust="$PREV_SPEC"
+name="$PREV_NAME"
+convert_script="$CONVERT_SCRIPT"
+
+stamp="${sample_img}#${adjust}#${name}"
+stamp_hash=$(printf '%s' "$stamp" | md5sum | cut -d' ' -f1)
+stamp_file="$cache_dir/stamp_${stamp_hash}"
+rendered_file="$cache_dir/rendered_${stamp_hash}"
+palette_file="$cache_dir/palette_${stamp_hash}.json"
+thumb="$cache_dir/thumb_${stamp_hash}.png"
+
+if [[ -f "$stamp_file" && "$(< "$stamp_file")" == "$stamp" && -s "$rendered_file" ]]; then
+    cat "$rendered_file"
+    exit 0
+fi
+
+swatch_row() {
+    local label="$1"; shift
+    printf "  %-11s" "$label"
+    local hex
+    for hex in "$@"; do
+        hex="${hex//\#/}"
+        [[ ${#hex} -eq 6 ]] && printf "\e[48;2;%d;%d;%dm     \e[0m" \
+            $((16#${hex:0:2})) $((16#${hex:2:2})) $((16#${hex:4:2}))
+    done
+    echo ""
+}
+
+# recol con fallbacks: imagenes de pocos colores unicos (pixel-art) hacen
+# paniquear a recol; reintenta con JPEG y luego con ruido (misma cadena que
+# el flujo de procesado). Sin esto el preview muere con traceback de python.
+recol_try() {
+    local img="$1" spec="$2" out="$3"
+    local lnk
+    # symlink con nombre unico: recol escribe PPMs en /tmp segun el stem del
+    # input; dos corridas concurrentes con el mismo stem colisionan y paniquean
+    lnk=$(mktemp -u --suffix=".${img##*.}")
+    ln -s -- "$img" "$lnk"
+    # brace + 2>/dev/null: silencia el "Abortado" que bash imprime cuando
+    # recol paniquea (sino spamea el preview en cada reintento)
+    if [[ -n "$spec" ]]; then
+        { recol -m "$lnk" -a "$spec" --json > "$out"; } 2>/dev/null
+    else
+        { recol -m "$lnk" --json > "$out"; } 2>/dev/null
+    fi
+    rm -f "$lnk"
+}
+recol_fb() {
+    local img="$1" spec="$2" out="$3"
+    local fb="$cache_dir/fb_${stamp_hash}.jpg"
+    recol_try "$img" "$spec" "$out"
+    [[ -s "$out" ]] && return 0
+    ffmpeg -y -loglevel error -i "$img" -qscale:v 2 "$fb" 2>/dev/null
+    recol_try "$fb" "$spec" "$out"
+    [[ -s "$out" ]] && return 0
+    # ruido fuerte: en thumbs chicas alls=6 no basta para superar el piso
+    # de colores unicos que recol exige
+    ffmpeg -y -loglevel error -i "$img" -vf "noise=alls=20:allf=t" -qscale:v 2 "$fb" 2>/dev/null
+    recol_try "$fb" "$spec" "$out"
+    [[ -s "$out" ]] && return 0
+    # ultimo recurso: imagen original a resolucion completa + ruido
+    ffmpeg -y -loglevel error -i "$img" -vf "noise=alls=6:allf=t" -qscale:v 2 "$fb" 2>/dev/null
+    recol_try "$fb" "$spec" "$out"
+}
+
+{
+    echo -e "\e[1;36m󰏘 Live Preview\e[0m"
+    echo -e "  \e[1;35m Palette:\e[0m $name"
+    echo -e "  \e[1;34m Adjust:\e[0m ${adjust:-(none)}"
+    echo ""
+
+    if [[ -n "$sample_img" && -f "$sample_img" ]]; then
+        base_name=$(basename "$sample_img")
+
+        if [[ ! -f "$thumb" || "$sample_img" -nt "$thumb" ]]; then
+            ffmpeg -y -loglevel error -i "$sample_img" -vf "scale=360:-2" "$thumb" 2>/dev/null \
+                || cp "$sample_img" "$thumb"
+        fi
+
+        if [[ ! -f "$palette_file" || ! -s "$palette_file" ]]; then
+            theme_a="$cache_dir/themeA_${stamp_hash}.json"
+            theme_b="$cache_dir/themeB_${stamp_hash}.json"
+            if [[ -n "$adjust" ]]; then
+                recol_fb "$thumb" "$adjust" "$theme_a"
+            else
+                recol_fb "$thumb" "" "$theme_a"
+            fi
+            # polaridad: si el tema base es claro, A=light (dark sale del invertido)
+            if [[ "$(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))["colors"]
+h = c["bg"][0].lstrip("#")
+r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+print("light" if 0.2126*r+0.7152*g+0.0722*b > 128 else "dark")' "$theme_a" 2>/dev/null)" == "light" ]]; then
+                inv_spec="invert=50,brightness=5"
+                [[ -n "$adjust" ]] && inv_spec="$inv_spec,$adjust"
+                recol_fb "$thumb" "$inv_spec" "$theme_b"
+                # solo si ambos temas salieron (evita traceback con archivos vacios)
+                [[ -s "$theme_a" && -s "$theme_b" ]] && \
+                    python3 "$convert_script" "$theme_b" "$theme_a" > "$palette_file"
+            else
+                inv_spec="invert=50"
+                [[ -n "$adjust" ]] && inv_spec="$inv_spec,$adjust"
+                recol_fb "$thumb" "$inv_spec" "$theme_b"
+                [[ -s "$theme_a" && -s "$theme_b" ]] && \
+                    python3 "$convert_script" "$theme_a" "$theme_b" > "$palette_file"
+            fi
+        fi
+
+        chafa -f sixel -s "${FZF_PREVIEW_COLUMNS:-50}x14" "$thumb" 2>/dev/null || chafa -s "${FZF_PREVIEW_COLUMNS:-50}x14" "$thumb"
+        echo ""
+
+        if [[ -s "$palette_file" ]]; then
+            swatch_row "UI dark"  "$(jq -r '.dark.primary // .dark.mPrimary' "$palette_file")" "$(jq -r '.dark.secondary // .dark.mSecondary' "$palette_file")" "$(jq -r '.dark.tertiary // .dark.mTertiary' "$palette_file")" "$(jq -r '.dark.error // .dark.mError' "$palette_file")"
+            swatch_row "Surface"  "$(jq -r '.dark.surface // .dark.mSurface' "$palette_file")" "$(jq -r '.dark.surface_container // .dark.mSurfaceVariant' "$palette_file")" "$(jq -r '.dark.outline_variant // .dark.mOutline' "$palette_file")" "$(jq -r '.dark.hover // .dark.mHover' "$palette_file")"
+            swatch_row "Terminal" $(jq -r '.dark.terminal | [.normal.black, .normal.red, .normal.green, .normal.yellow, .normal.blue, .normal.magenta, .normal.cyan, .normal.white] | .[]' "$palette_file")
+            swatch_row "Bright"   $(jq -r '.dark.terminal | [.bright.black, .bright.red, .bright.green, .bright.yellow, .bright.blue, .bright.magenta, .bright.cyan, .bright.white] | .[]' "$palette_file")
+            swatch_row "Light"    "$(jq -r '.light.primary // .light.mPrimary' "$palette_file")" "$(jq -r '.light.surface // .light.mSurface' "$palette_file")" "$(jq -r '.light.outline_variant // .light.mOutline' "$palette_file")"
+            echo ""
+            swatch_row "Term dark" "$(jq -r .dark.terminal.background "$palette_file")" "$(jq -r .dark.terminal.foreground "$palette_file")" "$(jq -r '.dark.terminal.selection_bg // .dark.terminal.selectionBg' "$palette_file")"
+        else
+            chafa -s "${FZF_PREVIEW_COLUMNS:-50}x${FZF_PREVIEW_LINES:-24}" "$thumb" 2>/dev/null
+            echo -e "\n  \e[1;31m[Notice: Could not generate palette]\e[0m"
+        fi
+    else
+        echo "  [!] No sample image found for live preview."
+    fi
+} > "$rendered_file"
+
+echo "$stamp" > "$stamp_file"
+cat "$rendered_file"
+EOF
+chmod +x "$LIVE_PREVIEW_SCRIPT"
+
+check_deps() {
+    ensure_recol || exit 1
+    for cmd in recol ffmpeg fzf chafa jq python3; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo -e "${C_RED}[ERROR] Missing dependency: '$cmd'.${C_RESET}"
+            exit 1
+        fi
+    done
+}
+
+load_config() {
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        save_config
+        return
+    fi
+
+    local key val
+    while IFS='=' read -r key val; do
+        key="${key// /}"
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        val="${val%$'\r'}"
+        # save_config guarda los strings entre comillas; el read literal no
+        # las evalua como hace source al parsear el hook: desquitar aqui
+        if [[ ${#val} -ge 2 ]]; then
+            case "$val" in
+                \"*\") val="${val#\"}"; val="${val%\"}" ;;
+                \'*\') val="${val#\'}"; val="${val%\'}" ;;
+            esac
+        fi
+
+        case "$key" in
+            SATURATION)   [[ "$val" =~ ^-?[0-9]+$ ]] && SATURATION="$val" ;;
+            CONTRAST)     [[ "$val" =~ ^-?[0-9]+$ ]] && CONTRAST="$val" ;;
+            BRIGHTNESS)   [[ "$val" =~ ^-?[0-9]+$ ]] && BRIGHTNESS="$val" ;;
+            TEMPERATURE)  [[ "$val" =~ ^-?[0-9]+$ ]] && TEMPERATURE="$val" ;;
+            TINT)         [[ "$val" =~ ^-?[0-9]+$ ]] && TINT="$val" ;;
+            VIBRANCE)     [[ "$val" =~ ^-?[0-9]+$ ]] && VIBRANCE="$val" ;;
+            HUE)          [[ "$val" =~ ^-?[0-9]+$ ]] && HUE="$val" ;;
+            NORMALIZE)    [[ "$val" =~ ^-?[0-9]+$ ]] && NORMALIZE="$val" ;;
+            EXTRA_SPEC)   EXTRA_SPEC="$val" ;;
+            VARIANT)      [[ "$val" =~ ^(Dark|Light|Both)$ ]] && VARIANT="$val" ;;
+            LIVE_PALETTE_NAME) LIVE_PALETTE_NAME="$val" ;;
+        esac
+    done < "$CONFIG_FILE"
+    return 0
+}
+
+save_config() {
+    cat > "$CONFIG_FILE" << EOF
+SATURATION=$SATURATION
+CONTRAST=$CONTRAST
+BRIGHTNESS=$BRIGHTNESS
+TEMPERATURE=$TEMPERATURE
+TINT=$TINT
+VIBRANCE=$VIBRANCE
+HUE=$HUE
+NORMALIZE=$NORMALIZE
+EXTRA_SPEC="$EXTRA_SPEC"
+VARIANT=$VARIANT
+LIVE_PALETTE_NAME="$LIVE_PALETTE_NAME"
+EOF
+}
+
+build_adjust_spec() {
+    ADJUST_SPEC=""
+    local -a parts=()
+    (( 10#$SATURATION  != 0 )) && parts+=("saturation=$SATURATION")
+    (( 10#$CONTRAST    != 0 )) && parts+=("contrast=$CONTRAST")
+    (( 10#$BRIGHTNESS  != 0 )) && parts+=("brightness=$BRIGHTNESS")
+    (( 10#$TEMPERATURE != 0 )) && parts+=("temperature=$TEMPERATURE")
+    (( 10#$TINT        != 0 )) && parts+=("tint=$TINT")
+    (( 10#$VIBRANCE    != 0 )) && parts+=("vibrance=$VIBRANCE")
+    (( 10#$HUE         != 0 )) && parts+=("hue=$HUE")
+    (( 10#$NORMALIZE   != 0 )) && parts+=("normalize=$NORMALIZE")
+    [[ -n "$EXTRA_SPEC" ]] && parts+=("$EXTRA_SPEC")
+    ADJUST_SPEC=$(IFS=,; echo "${parts[*]}")
+}
+
+reset_settings() {
+    SATURATION="0"; CONTRAST="0"; BRIGHTNESS="0"; TEMPERATURE="0"
+    TINT="0"; VIBRANCE="0"; HUE="0"; NORMALIZE="0"; EXTRA_SPEC=""
+    save_config
+}
+
+get_sample_image() {
+    if [[ -n "$SAMPLE_WALLPAPER" && -f "$SAMPLE_WALLPAPER" ]]; then
+        echo "$SAMPLE_WALLPAPER"
+        return 0
+    fi
+    if [[ ${#SELECTED_FILES[@]} -gt 0 && -f "${SELECTED_FILES[0]}" ]]; then
+        echo "${SELECTED_FILES[0]}"
+        return 0
+    fi
+    local found
+    found=$(find . -maxdepth 2 -type f \( "${IMG_PATTERN[@]}" \) 2>/dev/null | head -n 1)
+    if [[ -n "$found" && -f "$found" ]]; then
+        echo "$found"
+        return 0
+    fi
+    echo ""
+}
+
+prompt_setting_value() {
+    local label="$1" current="$2" presets="$3" regex="$4"
+    local out query selected choice ret
+
+    out=$(printf "%s\n" $presets | fzf --prompt="$label ❯ " \
+        --header="Current: $current | Select or type new value, then [ENTER] | [ESC]: Cancel" \
+        --print-query)
+    ret=$?
+
+    # fzf >= 0.61: ENTER sin match contra los items sale con rc=1 pero imprime el query
+    [[ $ret -ne 0 && $ret -ne 1 ]] && return 1
+    [[ -z "$out" ]] && return 1
+
+    query=$(head -n 1 <<< "$out")
+    selected=$(tail -n 1 <<< "$out")
+
+    choice="$selected"
+    if [[ -n "$query" && "$query" != "$selected" ]]; then
+        choice="$query"
+    fi
+
+    [[ -z "$choice" ]] && return 1
+
+    if [[ -n "$regex" && ! "$choice" =~ $regex ]]; then
+        echo -e "${C_RED}[!] Invalid value: '$choice'.${C_RESET}"
+        sleep 1
+        return 1
+    fi
+
+    echo "$choice"
+}
+
+interactive_tune_settings() {
+    local sample_img="$1"
+    local title_context="${2:-Wallpaper}"
+
+    [[ -z "$sample_img" || ! -f "$sample_img" ]] && sample_img=$(get_sample_image)
+
+    local cursor_pos=1
+
+    while true; do
+        build_adjust_spec
+
+        export PREV_IMG="$sample_img"
+        export PREV_SPEC="$ADJUST_SPEC"
+        export PREV_NAME="${title_context}"
+        export CONVERT_SCRIPT="$CONVERT_SCRIPT"
+
+        local menu_lines=()
+        menu_lines+=("󰄬  Continue with these settings ❯")
+        menu_lines+=("󰏘  Palette name            : <  ${CUSTOM_NAME:-(nombre de archivo)}  >  (Enter to change)")
+        menu_lines+=("󰅚  Saturation              : <  $SATURATION  >  (Enter to change)")
+        menu_lines+=("󰃠  Contrast                : <  $CONTRAST  >  (Enter to change)")
+        menu_lines+=("󰃟  Brightness              : <  $BRIGHTNESS  >  (Enter to change)")
+        menu_lines+=("󰔏  Temperature             : <  $TEMPERATURE  >  (Enter to change)")
+        menu_lines+=("󰖌  Tint                    : <  $TINT  >  (Enter to change)")
+        menu_lines+=("󰁨  Vibrance                : <  $VIBRANCE  >  (Enter to change)")
+        menu_lines+=("󰉼  Hue shift               : <  $HUE  >  (Enter to change)")
+        menu_lines+=("󰗑  Normalize               : <  $NORMALIZE  >  (Enter to change)")
+        menu_lines+=("󰘦  Extra adjust spec (raw) : <  ${EXTRA_SPEC:-(none)}  >  (Enter to change)")
+        menu_lines+=("󰜉  Reset to defaults")
+
+        local item ret
+        item=$(printf '%s\n' "${menu_lines[@]}" \
+            | fzf --prompt=" Adjust: ${title_context} ❯ " \
+                  --header="[ENTER]: Change setting / Continue  |  [ESC]: Back" \
+                  --bind="start:pos($cursor_pos)" \
+                  --preview "'$LIVE_PREVIEW_SCRIPT'" \
+                  --preview-window=right:55%:border-left)
+        ret=$?
+
+        [[ $ret -ne 0 && -z "$item" ]] && return 1
+        [[ -z "$item" ]] && return 1
+
+        case "$item" in
+            *"Continue"*)          cursor_pos=1 ;;
+            *"Palette name"*)      cursor_pos=2 ;;
+            *"Saturation"*)        cursor_pos=3 ;;
+            *"Contrast"*)          cursor_pos=4 ;;
+            *"Brightness"*)        cursor_pos=5 ;;
+            *"Temperature"*)       cursor_pos=6 ;;
+            *"Tint"*)              cursor_pos=7 ;;
+            *"Vibrance"*)          cursor_pos=8 ;;
+            *"Hue shift"*)         cursor_pos=9 ;;
+            *"Normalize"*)         cursor_pos=10 ;;
+            *"Extra"*)             cursor_pos=11 ;;
+            *"Reset"*)             cursor_pos=12 ;;
+        esac
+
+        case "$item" in
+            *"Continue"*)
+                save_config
+                return 0
+                ;;
+            *"Palette name"*)
+                local stem
+                stem=$(basename "${sample_img%.*}" 2>/dev/null)
+                local val
+                val=$(prompt_palette_name "${CUSTOM_NAME:-$stem}")
+                if [[ -n "$val" ]]; then
+                    if [[ -f "$PALETTES_DIR/$val.json" ]]; then
+                        local over
+                        over=$(printf "󰄬  Sobrescribir '$val'\n󰗼  Elegir otro nombre" | fzf \
+                            --prompt="󰏘  '$val.json' ya existe ❯ " \
+                            --header="[ENTER]: elegir | [ESC]: elegir otro nombre")
+                        if [[ -z "$over" || "$over" == *"otro nombre"* ]]; then
+                            continue
+                        fi
+                    fi
+                    CUSTOM_NAME="$val"
+                    echo -e "${C_GREEN}[OK] Palette name → $CUSTOM_NAME${C_RESET}"
+                    sleep 0.4
+                fi
+                continue
+                ;;
+            *"Saturation"*)
+                local val
+                val=$(prompt_setting_value "󰅚 Saturation (-100..100)" "$SATURATION" "0 10 15 20 25 30 -10 -15 -20 -30" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { SATURATION="$val"; echo -e "${C_GREEN}[OK] Saturation → $SATURATION${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Contrast"*)
+                local val
+                val=$(prompt_setting_value "󰃠 Contrast (-100..100)" "$CONTRAST" "0 5 10 15 20 25 30 -5 -10 -15 -20" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { CONTRAST="$val"; echo -e "${C_GREEN}[OK] Contrast → $CONTRAST${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Brightness"*)
+                local val
+                val=$(prompt_setting_value "󰃟 Brightness (-100..100)" "$BRIGHTNESS" "0 5 10 15 20 -5 -10 -15 -20" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { BRIGHTNESS="$val"; echo -e "${C_GREEN}[OK] Brightness → $BRIGHTNESS${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Temperature"*)
+                local val
+                val=$(prompt_setting_value "󰔏 Temperature (-100..100, + warm / - cool)" "$TEMPERATURE" "0 5 10 15 20 -5 -10 -15 -20" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { TEMPERATURE="$val"; echo -e "${C_GREEN}[OK] Temperature → $TEMPERATURE${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Tint"*)
+                local val
+                val=$(prompt_setting_value "󰖌 Tint (-100..100, + magenta / - green)" "$TINT" "0 5 10 15 -5 -10 -15" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { TINT="$val"; echo -e "${C_GREEN}[OK] Tint → $TINT${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Vibrance"*)
+                local val
+                val=$(prompt_setting_value "󰁨 Vibrance (-100..100, smart saturation)" "$VIBRANCE" "0 10 20 30 -10 -20 -30" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { VIBRANCE="$val"; echo -e "${C_GREEN}[OK] Vibrance → $VIBRANCE${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Hue shift"*)
+                local val
+                val=$(prompt_setting_value "󰉼 Hue shift (-100..100)" "$HUE" "0 5 10 15 -5 -10 -15 30 -30" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { HUE="$val"; echo -e "${C_GREEN}[OK] Hue shift → $HUE${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Normalize"*)
+                local val
+                val=$(prompt_setting_value "󰗑 Normalize (-100..100, unify lightness)" "$NORMALIZE" "0 10 20 30 50 -10 -20" "^-?[0-9]+$")
+                [[ -n "$val" && "$val" -ge -100 && "$val" -le 100 ]] && { NORMALIZE="$val"; echo -e "${C_GREEN}[OK] Normalize → $NORMALIZE${C_RESET}"; sleep 0.4; }
+                continue
+                ;;
+            *"Extra"*)
+                local val out query
+                out=$(printf "%s" "$EXTRA_SPEC" | fzf --prompt="󰘦  Extra spec (recol -a syntax, ej: pal.hue=180,sel.invert) ❯ " \
+                    --header="Current: ${EXTRA_SPEC:-(none)} | Type spec + [ENTER] | [ESC]: Cancel" --print-query)
+                ret=$?
+                # rc 0 o 1: ENTER acepta el query (1 = sin match contra los items)
+                [[ $ret -eq 0 || $ret -eq 1 ]] && {
+                    query=$(head -n 1 <<< "$out")
+                    query="${query//$'\n'/}"
+                    EXTRA_SPEC="$query"
+                    echo -e "${C_GREEN}[OK] Extra spec → ${EXTRA_SPEC:-(none)}${C_RESET}"
+                    sleep 0.4
+                }
+                continue
+                ;;
+            *"Reset"*)
+                reset_settings
+                echo -e "${C_CYAN}[i] Settings reset to defaults.${C_RESET}"
+                sleep 0.6
+                continue
+                ;;
+        esac
+    done
+}
+
+menu_processing_settings() {
+    interactive_tune_settings "" "Global Defaults"
+}
+
+menu_settings() {
+    while true; do
+        mapfile -t schemes < <(find "$PALETTES_DIR" -maxdepth 1 -name "*.json" ! -name "registry.json" -printf '%f\n' | sort)
+
+        local out ret key
+        out=$(printf "%s\n" "${schemes[@]}" | fzf --multi --expect=ctrl-d,ctrl-r,ctrl-g \
+            --prompt="󰏘  Edit Local Palette ❯ " \
+            --header="[ENTER]: Edit | [CTRL-R]: Rename | [CTRL-D]: Delete | [CTRL-G]: Migrate to format 2 (TAB: multi-select) | [ESC]: Back" \
+            --bind="ctrl-a:select-all" \
+            --preview "'$PREVIEW_SCRIPT' '$PALETTES_DIR/{}'" \
+            --preview-window=right:50%:border-left)
+        ret=$?
+
+        # ESC o sin seleccion: volver al menu principal
+        [[ $ret -eq 130 || $ret -gt 1 ]] && return 0
+        [[ -z "$out" ]] && return 0
+
+        key=$(head -n 1 <<< "$out")
+        mapfile -t sel < <(tail -n +2 <<< "$out" | grep -v '^$')
+        [[ ${#sel[@]} -eq 0 ]] && continue
+
+        if [[ "$key" == "ctrl-r" ]]; then
+            if [[ ${#sel[@]} -ne 1 ]]; then
+                echo -e "${C_CYAN}[i] Rename: seleccioná una sola palette (TAB para una).${C_RESET}"
+                sleep 0.8
+                continue
+            fi
+            local old="${sel[0]}" new_name
+            local base="${old%.json}"
+            new_name=$(prompt_palette_name "$base")
+            [[ -z "$new_name" ]] && continue
+            if [[ "$new_name" == "$base" ]]; then
+                continue
+            fi
+            if [[ -f "$PALETTES_DIR/$new_name.json" ]]; then
+                local over
+                over=$(printf "󰄬  Sobrescribir '%s'\n󰅚  Cancelar" "$new_name" | fzf \
+                    --prompt="󰏘  '$new_name.json' ya existe ❯ " \
+                    --header="[ENTER]: elegir | [ESC]: cancelar")
+                [[ -z "$over" || "$over" == *"Cancelar"* ]] && continue
+            fi
+            mv -f "$PALETTES_DIR/$old" "$PALETTES_DIR/$new_name.json"
+            echo -e "${C_GREEN}[OK] Renamed: $old → $new_name.json${C_RESET}"
+            sleep 0.8
+            continue
+        fi
+
+        # NOTA: ctrl-m NO se puede usar con --expect (ctrl-m == Enter en ASCII)
+        if [[ "$key" == "ctrl-g" ]]; then
+            local m=0 skipped=0 f
+            for f in "${sel[@]}"; do
+                local res
+                res=$(python3 -c '
+import json, sys
+path = sys.argv[1]
+FMT1 = {"mPrimary":"primary","mOnPrimary":"on_primary","mSecondary":"secondary",
+        "mOnSecondary":"on_secondary","mTertiary":"tertiary","mOnTertiary":"on_tertiary",
+        "mError":"error","mOnError":"on_error","mSurface":"surface","mOnSurface":"on_surface",
+        "mSurfaceVariant":"surface_container","mOnSurfaceVariant":"on_surface_variant",
+        "mOutline":"outline_variant","mShadow":"shadow","mHover":"hover","mOnHover":"on_hover",
+        "selectionFg":"selection_fg","selectionBg":"selection_bg","cursorText":"cursor_text"}
+data = json.load(open(path))
+if data.get("version") == 2:
+    print("already"); sys.exit(0)
+for mode in ("dark", "light"):
+    if mode not in data: continue
+    data[mode] = {FMT1.get(k, k): v for k, v in data[mode].items()}
+    term = data[mode].get("terminal")
+    if isinstance(term, dict):
+        data[mode]["terminal"] = {FMT1.get(k, k): v for k, v in term.items()}
+data.pop("version", None)
+with open(path, "w") as fh:
+    json.dump({"version": 2, **data}, fh, indent=2)
+    fh.write("\n")
+print("migrated")' "$PALETTES_DIR/$f" 2>&1)
+                if [[ "$res" == "migrated" ]]; then
+                    echo -e "${C_GREEN}  󰄬 $f → formato 2${C_RESET}"
+                    m=$((m + 1))
+                elif [[ "$res" == "already" ]]; then
+                    echo -e "${C_CYAN}  󰅚 $f (ya es formato 2)${C_RESET}"
+                    skipped=$((skipped + 1))
+                else
+                    echo -e "${C_RED}  󰖷 $f: $res${C_RESET}"
+                fi
+            done
+            echo -e "${C_GREEN}[OK] $m migradas, $skipped ya estaban en formato 2.${C_RESET}"
+            noctalia msg config-reload >/dev/null 2>&1
+            sleep 1.2
+            continue
+        fi
+
+        if [[ "$key" == "ctrl-d" ]]; then
+            local n=${#sel[@]} answer
+            echo ""
+            for f in "${sel[@]}"; do
+                echo -e "  ${C_RED}󰖷 $f${C_RESET}"
+            done
+            answer=$(printf "󰄬  Eliminar\n󰅚  Cancelar" | fzf \
+                --prompt="󰏘  Eliminar $n palette(s)? ❯ " \
+                --header="[ENTER]: confirmar | [ESC]: cancelar")
+            if [[ "$answer" == *"Eliminar"* ]]; then
+                local d=0
+                for f in "${sel[@]}"; do
+                    if [[ -f "$PALETTES_DIR/$f" ]]; then
+                        rm -f "$PALETTES_DIR/$f"
+                        d=$((d + 1))
+                    fi
+                done
+                echo -e "${C_GREEN}[OK] $d palette(s) eliminadas.${C_RESET}"
+            else
+                echo -e "${C_CYAN}[i] Cancelado.${C_RESET}"
+            fi
+            sleep 0.8
+            continue
+        fi
+
+        # ENTER: editar (una o varias seleccionadas)
+        for f in "${sel[@]}"; do
+            ${EDITOR:-nano} "$PALETTES_DIR/$f"
+            echo -e "${C_GREEN}[OK] Palette updated: $f${C_RESET}"
+        done
+        sleep 0.6
+    done
+}
+
+abs_path() { realpath -m "$1" 2>/dev/null || printf '%s' "$1"; }
+
+compute_settings_stamp() {
+    printf '%s' "${ADJUST_SPEC}#${VARIANT}" | md5sum | cut -d' ' -f1
+}
+
+prune_stamps() {
+    local f line dest
+    for f in "$STAMPS_DIR"/*; do
+        [[ -f "$f" ]] || continue
+        line=$(< "$f")
+        dest="${line#* }"
+        [[ -n "$dest" && ! -f "$dest" ]] && rm -f "$f"
+    done
+}
+
+sanitize_name() {
+    local name="$1"
+    name=$(printf '%s' "$name" | sed -E 's/[^a-zA-Z0-9 _-]+/-/g; s/ +/-/g; s/^[-]+|[-]+$//g; s/[-]+/-/g')
+    printf '%s' "${name,,}"
+}
+
+prompt_palette_name() {
+    local default="$1" out query selected choice
+    out=$(printf "%s" "$default" | fzf --prompt="󰏘  Nombre del palette ❯ " \
+        --header="Default: $default  |  Escribí o editá el nombre + [ENTER]  |  [ESC]: atrás" \
+        --print-query)
+    ret=$?
+    # rc 0 o 1: ENTER acepta el query (1 = sin match, fzf >= 0.61)
+    [[ $ret -ne 0 && $ret -ne 1 ]] && return 1
+    [[ -z "$out" ]] && return 1
+    query=$(head -n 1 <<< "$out")
+    selected=$(tail -n 1 <<< "$out")
+    choice="$selected"
+    [[ -n "$query" && "$query" != "$selected" ]] && choice="$query"
+    # conservar mayusculas/espacios (estilo "Cream Autumn"), solo sacar chars invalidos
+    choice=$(printf '%s' "$choice" | sed -E 's#[\\/:*?"<>|]##g; s/^ +| +$//g')
+    [[ -z "$choice" ]] && return 1
+    printf '%s' "$choice"
+}
+
+process_palette() {
+    local src="$1" dest="$2"
+    local dest_abs key stamp_file stamp tmp tmp2 err_file
+    dest_abs=$(abs_path "$dest")
+    key=$(printf '%s' "$dest_abs" | md5sum | cut -d' ' -f1)
+    stamp_file="$STAMPS_DIR/$key"
+    stamp=$(compute_settings_stamp)
+    mkdir -p "$STAMPS_DIR"
+
+    if [[ -f "$dest" && ! "$src" -nt "$dest" && -f "$stamp_file" && "$(< "$stamp_file")" == "$stamp $dest_abs" ]]; then
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$dest")"
+
+    theme_0=$(mktemp); theme_d=$(mktemp); theme_l=$(mktemp)
+    tmp=$(mktemp); tmp2=$(mktemp); err_file=$(mktemp)
+
+    # Genera un tema recol; si recol paniquea con imagenes de muy pocos colores
+    # unicos (assert en palettegen.rs), reintenta con copia JPEG y luego con
+    # ruido agregado. NUNCA pasar -a con spec vacio (panica en cli.rs).
+    run_recol() {
+        local rsrc="$1" rspec="$2" rout="$3" rerr="$4"
+        local rlnk
+        # symlink unico: evita la colision de /tmp/<stem>_<N>.ppm entre
+        # corridas concurrentes de recol sobre el mismo path
+        rlnk=$(mktemp -u --suffix=".${rsrc##*.}")
+        ln -s -- "$rsrc" "$rlnk"
+        local -a rargs=(-m "$rlnk" --json)
+        [[ -n "$rspec" ]] && rargs+=(-a "$rspec")
+        # brace + 2>/dev/null: silencia el "Abortado" de bash cuando recol paniquea
+        if { recol "${rargs[@]}" 2>"$rerr" > "$rout"; } 2>/dev/null && [[ -s "$rout" ]]; then
+            rm -f "$rlnk"; return 0
+        fi
+        local rjpg
+        rjpg=$(mktemp --suffix=.jpg)
+        ffmpeg -y -loglevel error -i "$rsrc" -qscale:v 2 "$rjpg" 2>/dev/null
+        local -a fargs=(-m "$rjpg" --json)
+        [[ -n "$rspec" ]] && fargs+=(-a "$rspec")
+        if { recol "${fargs[@]}" 2>"$rerr" > "$rout"; } 2>/dev/null && [[ -s "$rout" ]]; then
+            rm -f "$rlnk" "$rjpg"; return 0
+        fi
+        ffmpeg -y -loglevel error -i "$rsrc" -vf "noise=alls=6:allf=t" -qscale:v 2 "$rjpg" 2>/dev/null
+        { recol "${fargs[@]}" 2>"$rerr" > "$rout"; } 2>/dev/null
+        local rrc=$?
+        rm -f "$rlnk" "$rjpg"
+        (( rrc == 0 )) && [[ -s "$rout" ]]
+    }
+
+    ok=1
+    run_recol "$src" "$ADJUST_SPEC" "$theme_0" "$err_file" || ok=0
+
+    if (( ok )); then
+        # recol preserva la polaridad de la imagen fuente: si bg[0] es claro,
+        # el tema generado ES un tema claro y el dark sale del invertido
+        # (y viceversa para imagenes oscuras).
+        pol=$(python3 -c '
+import json, sys
+c = json.load(open(sys.argv[1]))["colors"]
+h = c["bg"][0].lstrip("#")
+r, g, b = int(h[0:2],16), int(h[2:4],16), int(h[4:6],16)
+print("light" if 0.2126*r+0.7152*g+0.0722*b > 128 else "dark")' "$theme_0")
+
+        conv_args=()
+        if [[ "$VARIANT" == "Dark" ]]; then
+            if [[ "$pol" == "light" ]]; then
+                dark_spec="invert=50,brightness=5"
+                [[ -n "$ADJUST_SPEC" ]] && dark_spec="$dark_spec,$ADJUST_SPEC"
+                run_recol "$src" "$dark_spec" "$theme_d" "$err_file" || ok=0
+            else
+                theme_d="$theme_0"
+            fi
+            conv_args=("$theme_d" "")
+        else
+            if [[ "$pol" == "dark" ]]; then
+                theme_d="$theme_0"
+                light_spec="invert=50"
+                [[ -n "$ADJUST_SPEC" ]] && light_spec="$light_spec,$ADJUST_SPEC"
+                run_recol "$src" "$light_spec" "$theme_l" "$err_file" || ok=0
+            else
+                theme_l="$theme_0"
+                dark_spec="invert=50,brightness=5"
+                [[ -n "$ADJUST_SPEC" ]] && dark_spec="$dark_spec,$ADJUST_SPEC"
+                run_recol "$src" "$dark_spec" "$theme_d" "$err_file" || ok=0
+            fi
+            conv_args=("$theme_d" "$theme_l")
+        fi
+    fi
+
+    if (( ok )) && python3 "$CONVERT_SCRIPT" "${conv_args[@]}" > "$tmp" 2>>"$err_file" && [[ -s "$tmp" ]]; then
+        case "$VARIANT" in
+            Dark)  jq '.light = .dark' "$tmp" > "$tmp2" && mv "$tmp2" "$dest" ;;
+            Light) jq '.dark = .light' "$tmp" > "$tmp2" && mv "$tmp2" "$dest" ;;
+            *)     mv "$tmp" "$dest" ;;
+        esac
+    else
+        ok=0
+    fi
+    rm -f "$theme_0" "$theme_d" "$theme_l"
+
+    if (( ok )); then
+        rm -f "$tmp" "$tmp2" "$err_file"
+        printf '%s %s' "$stamp" "$dest_abs" > "$stamp_file"
+        return 0
+    else
+        rm -f "$tmp" "$tmp2" "$theme_d" "$theme_l" "$dest"
+        echo -e "${C_RED}[ERROR] recol failed for '$src':${C_RESET}" >&2
+        head -n 2 "$err_file" | sed 's/^/  /' >&2
+        rm -f "$err_file"
+        return 2
+    fi
+}
+
+process_batch() {
+    local mode="$1" source_dir="$2"
+    shift 2
+    local -a files=("$@")
+    ((${#files[@]} == 0)) && return 0
+
+    local status_dir
+    status_dir=$(mktemp -d)
+    local i=0 running=0 img dest name stem
+
+    for img in "${files[@]}"; do
+        stem=$(basename "${img%.*}")
+        if [[ "$mode" == "folder" ]]; then
+            if [[ -n "$CUSTOM_NAME" ]]; then
+                name=$(sanitize_name "$CUSTOM_NAME-$stem")
+            else
+                name=$(sanitize_name "${source_dir}-${stem}")
+            fi
+        elif [[ -n "$CUSTOM_NAME" ]]; then
+            if [[ ${#files[@]} -eq 1 ]]; then
+                name="$CUSTOM_NAME"
+            else
+                name=$(sanitize_name "$CUSTOM_NAME-$stem")
+            fi
+        else
+            name=$(sanitize_name "$stem")
+        fi
+        dest="$PALETTES_DIR/$name.json"
+        (
+            process_palette "$img" "$dest"
+            printf '%s' "$?" > "$status_dir/$i"
+        ) &
+        running=$((running + 1))
+        if (( running >= MAX_JOBS )); then
+            wait -n
+            running=$((running - 1))
+        fi
+        i=$((i + 1))
+    done
+    wait
+
+    local s
+    for s in "$status_dir"/*; do
+        case "$(< "$s")" in
+            0) count_ok=$((count_ok + 1));;
+            1) count_skip=$((count_skip + 1));;
+            *) count_err=$((count_err + 1));;
+        esac
+    done
+    rm -rf "$status_dir"
+}
+
+# /*
+#  * LIVE PALETTE: hook wallpaper_changed de Noctalia (v5+).
+#  * Noctalia setea NOCTALIA_WALLPAPER_PATH al cambiar el wallpaper;
+#  * el hook regenera la palette y la re-aplica por IPC si esta activa.
+#  */
+live_hook_enabled() {
+    [[ -f "$HOOK_SCRIPT" ]] && grep -q "wallpaper_changed.*live-palette.sh" "$HOOKS_CONF" 2>/dev/null
+}
+
+install_live_hook() {
+    mkdir -p "$(dirname "$HOOK_SCRIPT")"
+
+    cat > "$HOOK_SCRIPT" << 'HOOKSCRIPT'
+#!/usr/bin/env bash
+# Live palette: regenera la palette de Noctalia cuando cambia el wallpaper.
+# Llamado por el hook wallpaper_changed (NOCTALIA_WALLPAPER_PATH seteado por Noctalia).
+set -u
+# PATH completo: el hook corre con un PATH minimo (sin ~/.cargo/bin ni ~/.local/bin)
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/run/current-system/sw/bin:/run/current-system/profile/bin:/usr/local/bin:/usr/bin:/bin${PATH:+:$PATH}"
+img="${NOCTALIA_WALLPAPER_PATH:-}"
+[[ -n "$img" && -f "$img" ]] || exit 0
+
+# ajustes + nombre desde la conf del ricer (EXTRA_SPEC/LIVE_PALETTE_NAME van citados)
+conf="$HOME/.config/noctalia-ricer.conf"
+name="Live"
+[[ -r "$conf" ]] && source "$conf"
+
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/noctalia-ricer"
+mkdir -p "$cache"
+
+# serializar: un solo run a la vez (cambios rapidos)
+exec 9>"$cache/live.lock"
+flock -n 9 || exit 0
+
+# spec de ajustes (igual que build_adjust_spec del ricer), ANTES del stamp:
+# cambiar un ajuste debe invalidar el cache
+parts=()
+for kv in "saturation=${SATURATION:-0}" "contrast=${CONTRAST:-0}" "brightness=${BRIGHTNESS:-0}" \
+          "temperature=${TEMPERATURE:-0}" "tint=${TINT:-0}" "vibrance=${VIBRANCE:-0}" \
+          "hue=${HUE:-0}" "normalize=${NORMALIZE:-0}"; do
+    v="${kv##*=}"
+    [[ "$v" != 0 ]] && parts+=("$kv")
+done
+[[ -n "${EXTRA_SPEC:-}" ]] && parts+=("$EXTRA_SPEC")
+spec="$(IFS=,; echo "${parts[*]}")"
+
+# skip si es el mismo wallpaper y mismos ajustes (hooks de startup)
+cur="$(stat -Lc '%Y:%s' "$img" 2>/dev/null):$name:$spec"
+[[ -f "$cache/live-stamp" && "$(cat "$cache/live-stamp" 2>/dev/null)" == "$cur" ]] && exit 0
+
+export NOCTALIA_ADJUST_SPEC="$spec"
+if ! "$HOME/.local/bin/wallpaper-to-noctalia" "$img" "$name" >> "$cache/live.log" 2>&1; then
+    echo "[$(date '+%F %T')] ERROR regenerando desde $img" >> "$cache/live.log"
+    exit 0
+fi
+printf '%s' "$cur" > "$cache/live-stamp"
+
+# re-aplicar si es la palette activa: config-reload re-lee el JSON del palette
+# y re-renderiza los templates al instante (templates-apply NO re-lee el JSON,
+# y color-scheme-set con el mismo valor es no-op).
+scheme="$(noctalia msg color-scheme-get 2>/dev/null)"
+if [[ "$scheme" == "custom $name" ]]; then
+    noctalia msg config-reload >/dev/null 2>&1
+fi
+HOOKSCRIPT
+    chmod +x "$HOOK_SCRIPT"
+
+    # registrar en config.toml (idempotente: reemplaza la linea previa)
+    local cmd="\"$HOOK_SCRIPT\""
+    if grep -q '^\[hooks\]' "$HOOKS_CONF" 2>/dev/null; then
+        sed -i '/^wallpaper_changed[[:space:]]*=/d' "$HOOKS_CONF"
+        sed -i "/^\[hooks\]/a wallpaper_changed = $cmd" "$HOOKS_CONF"
+    else
+        printf '\n[hooks]\nwallpaper_changed = %s\n' "$cmd" >> "$HOOKS_CONF"
+    fi
+
+    noctalia msg config-reload >/dev/null 2>&1
+}
+
+uninstall_live_hook() {
+    if grep -q '^\[hooks\]' "$HOOKS_CONF" 2>/dev/null; then
+        sed -i '/^wallpaper_changed[[:space:]]*=/d' "$HOOKS_CONF"
+        # dejar la seccion solo si quedan otros hooks
+        if [[ "$(sed -n '/^\[hooks\]/,/^\[/p' "$HOOKS_CONF" | grep -c '=')" -le 1 ]]; then
+            sed -i '/^\[hooks\]/d' "$HOOKS_CONF"
+        fi
+        noctalia msg config-reload >/dev/null 2>&1
+    fi
+}
+
+# genera la palette live desde el wallpaper actual y devuelve el nombre
+live_regenerate() {
+    local img
+    img=$(noctalia msg wallpaper-get 2>/dev/null | head -n 1)
+    [[ -n "$img" && -f "$img" ]] || { echo -e "${C_RED}[!] No active wallpaper found.${C_RESET}"; return 1; }
+    NOCTALIA_WALLPAPER_PATH="$img" "$HOOK_SCRIPT"
+    echo -e "${C_GREEN}[OK] '$LIVE_PALETTE_NAME.json' generated from: $(basename "$img")${C_RESET}"
+}
+
+menu_live_palette() {
+    while true; do
+        local status="󰅚  disabled"
+        live_hook_enabled && status="󰄬  enabled"
+        local scheme
+        scheme=$(noctalia msg color-scheme-get 2>/dev/null)
+
+        local choice
+        choice=$(printf "󰗑  Toggle: %s\n󰏘  Palette name            : <  $LIVE_PALETTE_NAME  >\n󰘮  Tune settings (preview)\n󰜉  Regenerate & apply now\n󰋚  Save copy (freeze current)\n󰗼  Back" "$status" | \
+            fzf --prompt="󰥔  LIVE PALETTE (auto on wallpaper change) ❯ " \
+                --header="Active scheme: ${scheme:-(noctalia not running)} | [ESC]: Back")
+        [[ -z "$choice" ]] && return 0
+
+        case "$choice" in
+            *"Toggle"*)
+                if live_hook_enabled; then
+                    uninstall_live_hook
+                    echo -e "${C_CYAN}[i] Live palette hook disabled.${C_RESET}"
+                else
+                    install_live_hook
+                    echo -e "${C_GREEN}[OK] Hook installed ($HOOKS_CONF).${C_RESET}"
+                    echo -e "${C_CYAN}[i] Regenerating from current wallpaper...${C_RESET}"
+                    live_regenerate
+                    local over
+                    over=$(printf "󰄬  Yes\n󰅚  No" | fzf \
+                        --prompt="󰥔  Activate '$LIVE_PALETTE_NAME' as active palette? ❯ " \
+                        --header="[ENTER]: confirm | [ESC]: no")
+                    if [[ "$over" == *"Yes"* ]]; then
+                        noctalia msg color-scheme-set custom "$LIVE_PALETTE_NAME" >/dev/null 2>&1 \
+                            && echo -e "${C_GREEN}[OK] Active palette → $LIVE_PALETTE_NAME${C_RESET}"
+                    fi
+                fi
+                sleep 1
+                ;;
+            *"Palette name"*)
+                local val
+                val=$(prompt_palette_name "$LIVE_PALETTE_NAME")
+                if [[ -n "$val" && "$val" != "$LIVE_PALETTE_NAME" ]]; then
+                    # si estaba activa con el nombre viejo, migrar
+                    local was_active=false
+                    [[ "$(noctalia msg color-scheme-get 2>/dev/null)" == "custom $LIVE_PALETTE_NAME" ]] && was_active=true
+                    if [[ -f "$PALETTES_DIR/$LIVE_PALETTE_NAME.json" && ! -f "$PALETTES_DIR/$val.json" ]]; then
+                        mv "$PALETTES_DIR/$LIVE_PALETTE_NAME.json" "$PALETTES_DIR/$val.json"
+                    fi
+                    if live_hook_enabled; then
+                        install_live_hook   # re-escribe script + config.toml
+                        noctalia msg config-reload >/dev/null 2>&1
+                    fi
+                    LIVE_PALETTE_NAME="$val"
+                    save_config
+                    $was_active && noctalia msg color-scheme-set custom "$val" >/dev/null 2>&1
+                    echo -e "${C_GREEN}[OK] Live palette name → $val${C_RESET}"
+                fi
+                sleep 0.6
+                ;;
+            *"Tune settings"*)
+                local img
+                img=$(noctalia msg wallpaper-get 2>/dev/null | head -n 1)
+                [[ -n "$img" && -f "$img" ]] || img=$(get_sample_image)
+                if interactive_tune_settings "$img" "Live palette"; then
+                    live_hook_enabled && live_regenerate
+                fi
+                ;;
+            *"Regenerate"*)
+                if live_regenerate; then
+                    # ya activa: config-reload re-lee el JSON al instante; sino: activarla
+                    if [[ "$(noctalia msg color-scheme-get 2>/dev/null)" == "custom $LIVE_PALETTE_NAME" ]]; then
+                        noctalia msg config-reload >/dev/null 2>&1
+                    else
+                        noctalia msg color-scheme-set custom "$LIVE_PALETTE_NAME" >/dev/null 2>&1
+                    fi
+                    echo -e "${C_GREEN}[OK] Applied.${C_RESET}"
+                fi
+                sleep 0.8
+                ;;
+            *"Save copy"*)
+                if [[ ! -f "$PALETTES_DIR/$LIVE_PALETTE_NAME.json" ]]; then
+                    echo -e "${C_RED}[!] '$LIVE_PALETTE_NAME.json' no existe. Corré 'Regenerate & apply now' primero.${C_RESET}"
+                    sleep 1.2
+                    continue
+                fi
+                # default del nombre: wallpaper actual
+                local save_img save_base newname
+                save_img=$(noctalia msg wallpaper-get 2>/dev/null | head -n 1)
+                save_base=$(basename "${save_img%.*}" 2>/dev/null)
+                [[ -z "$save_base" ]] && save_base="$LIVE_PALETTE_NAME"
+                newname=$(prompt_palette_name "$save_base") || continue
+                [[ -z "$newname" ]] && continue
+                if [[ -f "$PALETTES_DIR/$newname.json" ]]; then
+                    local over
+                    over=$(printf "󰄬  Yes\n󰅚  No" | fzf \
+                        --prompt="󰏘  '$newname.json' ya existe. ¿Sobrescribir? ❯ " \
+                        --header="[ENTER]: sí | [ESC]: no")
+                    [[ "$over" != *"Yes"* ]] && continue
+                    rm -f "$PALETTES_DIR/$newname.json"
+                fi
+                cp "$PALETTES_DIR/$LIVE_PALETTE_NAME.json" "$PALETTES_DIR/$newname.json"
+                echo -e "${C_GREEN}[OK] Saved: '$newname.json' (congelada — la live sigue actualizándose).${C_RESET}"
+                # ofrecer activarla
+                local act
+                act=$(printf "󰄬  Yes\n󰅚  No" | fzf \
+                    --prompt="󰏘  Activate '$newname' as active palette? ❯ " \
+                    --header="[ENTER]: sí | [ESC]: no")
+                if [[ "$act" == *"Yes"* ]]; then
+                    noctalia msg color-scheme-set custom "$newname" >/dev/null 2>&1 \
+                        && echo -e "${C_GREEN}[OK] Active palette → $newname${C_RESET}"
+                fi
+                sleep 0.8
+                ;;
+        esac
+    done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+
+check_deps
+load_config
+
+# Si el cwd no tiene imágenes, trabajar directo en la carpeta de wallpapers
+if ! find . -maxdepth 2 -type f \( "${IMG_PATTERN[@]}" \) 2>/dev/null | head -n 1 | grep -q .; then
+    if [[ -d "$WALLPAPER_DIR" ]]; then
+        echo -e "${C_CYAN}[*] No images in cwd. Working from '$WALLPAPER_DIR'...${C_RESET}"
+        cd "$WALLPAPER_DIR" || exit 1
+    fi
+fi
+
+mkdir -p "$STAMPS_DIR"
+prune_stamps
+
+STATE="MAIN"
+
+while true; do
+    case "$STATE" in
+        "MAIN")
+            MAIN_CHOICE=$(printf "󰉋  1. Process full folder\n󰋹  2. Individual selection (fzf)\n󰏘  3. Edit local palettes\n󰘮  4. Processing Settings (Saturation/Contrast/Brightness/Temperature)\n󰥔  5. Live palette (auto-update on wallpaper change)\n󰍃  q. Exit" | \
+                fzf --prompt="[ 󰏘 NOCTALIA RICER ] ❯ " \
+                    --header="[q / ESC]: Exit" \
+                    --bind="q:abort")
+
+            if [[ -z "$MAIN_CHOICE" ]]; then
+                echo -e "${C_YELLOW}Exiting Noctalia Ricer...${C_RESET}"
+                exit 0
+            fi
+
+            case "$MAIN_CHOICE" in
+                *"1."*) SOURCE_MODE="Full folder"; STATE="SOURCE" ;;
+                *"2."*) SOURCE_MODE="Individual"; STATE="SOURCE" ;;
+                *"3."*) menu_settings; STATE="MAIN" ;;
+                *"4."*) menu_processing_settings; STATE="MAIN" ;;
+                *"5."*) menu_live_palette ;;
+                *"q."*) echo -e "${C_YELLOW}Exiting...${C_RESET}"; exit 0 ;;
+            esac
+            ;;
+
+        "SOURCE")
+            if [[ "$SOURCE_MODE" == "Full folder" ]]; then
+                mapfile -t folders < <(find . -maxdepth 1 -type d ! -name "." ! -name ".*" | sed 's|^\./||' | sort)
+                SOURCE_DIR=$(printf "%s\n" "${folders[@]}" | fzf --prompt="󰉋  Source folder ❯ " --header="[ESC]: Back")
+
+                [[ -z "$SOURCE_DIR" ]] && { STATE="MAIN"; continue; }
+
+                mapfile -t folder_images < <(find "$SOURCE_DIR" -type f \( "${IMG_PATTERN[@]}" \) | sed 's|^\./||' | sort)
+                if [[ ${#folder_images[@]} -eq 0 ]]; then
+                    echo -e "${C_RED}[!] No images found in '$SOURCE_DIR'.${C_RESET}"
+                    sleep 1.5
+                    STATE="SOURCE"
+                    continue
+                fi
+
+                SAMPLE_WALLPAPER=$(printf "%s\n" "${folder_images[@]}" | fzf \
+                    --prompt="󰋩  Select Sample Image to Preview & Tune ❯ " \
+                    --header="[ENTER]: Pick reference image for tuning | [ESC]: Back" \
+                    --preview 'chafa -f sixel -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" {} 2>/dev/null || chafa {}' \
+                    --preview-window=right:55%:border-left)
+
+                [[ -z "$SAMPLE_WALLPAPER" ]] && { STATE="SOURCE"; continue; }
+            else
+                mapfile -t SELECTED_FILES < <(find . -type f \( "${IMG_PATTERN[@]}" \) | sed 's|^\./||' | sort | \
+                    fzf --multi \
+                        --prompt="󰋹  Select images ❯ " \
+                        --header="[TAB]: Toggle | [CTRL-A]: Select All | [ESC]: Back" \
+                        --bind="ctrl-a:select-all,ctrl-d:deselect-all,ctrl-t:toggle-all" \
+                        --preview 'chafa -f sixel -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" {} 2>/dev/null || chafa {}' \
+                        --preview-window=right:55%:border-left)
+
+                [[ ${#SELECTED_FILES[@]} -eq 0 ]] && { STATE="MAIN"; continue; }
+                SOURCE_DIR="Individual"
+                CUSTOM_NAME=""
+
+                if [[ ${#SELECTED_FILES[@]} -gt 1 ]]; then
+                    SAMPLE_WALLPAPER=$(printf "%s\n" "${SELECTED_FILES[@]}" | fzf \
+                        --prompt="󰋩  Select Sample Image to Preview & Tune ❯ " \
+                        --header="[ENTER]: Pick reference image for tuning | [ESC]: Back" \
+                        --preview 'chafa -f sixel -s "${FZF_PREVIEW_COLUMNS}x${FZF_PREVIEW_LINES}" {} 2>/dev/null || chafa {}' \
+                        --preview-window=right:55%:border-left)
+                    [[ -z "$SAMPLE_WALLPAPER" ]] && { STATE="SOURCE"; continue; }
+                else
+                    SAMPLE_WALLPAPER="${SELECTED_FILES[0]}"
+                fi
+            fi
+            STATE="TUNE_SETTINGS"
+            ;;
+
+        "TUNE_SETTINGS")
+            context_name="Folder: $SOURCE_DIR"
+            [[ "$SOURCE_MODE" == "Individual" ]] && context_name=$(basename "$SAMPLE_WALLPAPER")
+
+            if interactive_tune_settings "$SAMPLE_WALLPAPER" "$context_name"; then
+                STATE="VARIANT"
+            else
+                STATE="SOURCE"
+            fi
+            ;;
+
+        "VARIANT")
+            VAR_CHOICE=$(printf "󱎕  Both\n󰖔  Dark\n󰖨  Light" | fzf --prompt="󰏘  Variant to generate ❯ " --header="Both = full palette (dark + light) | [ESC]: Back to tuning")
+            [[ -z "$VAR_CHOICE" ]] && { STATE="TUNE_SETTINGS"; continue; }
+            VARIANT="${VAR_CHOICE##* }"
+            save_config
+            STATE="PROCESS"
+            ;;
+
+        "PROCESS")
+            count_ok=0; count_skip=0; count_err=0
+
+            build_adjust_spec
+
+            echo -e "${C_CYAN}    Parallel jobs: $MAX_JOBS (override with MAX_JOBS=N)${C_RESET}"
+
+            if [[ "$SOURCE_MODE" == "Full folder" ]]; then
+                mapfile -t batch_files < <(find "$SOURCE_DIR" -type f \( "${IMG_PATTERN[@]}" \))
+                echo -e "\n${C_BLUE}[*] Generating palettes for '$SOURCE_DIR'...${C_RESET}"
+                process_batch "folder" "$SOURCE_DIR" "${batch_files[@]}"
+            else
+                echo -e "\n${C_BLUE}[*] Generating palettes for ${#SELECTED_FILES[@]} image(s)...${C_RESET}"
+                process_batch "individual" "" "${SELECTED_FILES[@]}"
+            fi
+
+            echo -e "\n${C_GREEN}[OK] Process completed successfully.${C_RESET}"
+            echo -e "${C_CYAN}    Generated: $count_ok  |  Skipped (Cache): $count_skip  |  Errors: $count_err${C_RESET}"
+            echo -e "${C_CYAN}    Palettes dir: $PALETTES_DIR${C_RESET}\n"
+
+            exit 0
+            ;;
+    esac
+done
+
+fi

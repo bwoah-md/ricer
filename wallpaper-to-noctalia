@@ -1,0 +1,352 @@
+#!/usr/bin/env nix-shell
+#! nix-shell -i python3 -p python3 ffmpeg cargo rustc git gcc
+"""Genera un palette de Noctalia desde una imagen usando recol.
+
+Uso:
+    wallpaper-to-noctalia IMAGEN [NOMBRE]
+
+Guarda el palette en ~/.config/noctalia/palettes/<NOMBRE>.json
+(Sin NOMBRE usa el nombre del archivo de imagen.)
+
+Dependencies are supplied by the Nix-shell launcher; recol is built automatically on first use.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import shutil
+from pathlib import Path
+
+XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+PALETTES_DIR = XDG_CONFIG_HOME / "noctalia" / "palettes"
+RECOL_ROOT = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")) / "noctalia-ricer" / "recol"
+RECOL_BIN = RECOL_ROOT / "bin"
+os.environ["PATH"] = str(RECOL_BIN) + os.pathsep + os.environ.get("PATH", "")
+
+
+def ensure_recol() -> None:
+    """Install recol once into the user's data directory when it is absent."""
+    if shutil.which("recol"):
+        return
+    if not shutil.which("cargo") or not shutil.which("git"):
+        sys.exit("error: recol is missing and Cargo/Git are unavailable; run this script through its Nix-shell launcher")
+
+    RECOL_ROOT.mkdir(parents=True, exist_ok=True)
+    print("recol is missing; building it once from the upstream repository...", file=sys.stderr)
+    try:
+        subprocess.run(
+            ["cargo", "install", "--git", "https://github.com/nlkli/recol", "--branch", "main", "--root", str(RECOL_ROOT)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"error: failed to build recol (cargo exited with status {exc.returncode})")
+ANSI = ["black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"]
+ACCENT_KEYS = ("red", "orange", "yellow", "green", "cyan", "blue", "magenta", "pink")
+
+
+def recol_theme(image: Path, spec: str | None = None) -> dict:
+    """Tema recol desde imagen; si paniquea (pocos colores unicos), reintenta
+    con copia JPEG y luego con ruido. Nunca pasar -a con spec vacio.
+    recol escribe PPMs en /tmp nombrados por el stem del input: dos corridas
+    concurrentes sobre el mismo path colisionan y paniquean, por eso cada
+    llamada usa un symlink con nombre unico."""
+    ensure_recol()
+    import os as _os
+    import tempfile
+
+    def _run(img_path: str, out: list) -> bool:
+        cmd = ["recol", "-m", img_path, "--json"]
+        if spec:
+            cmd += ["-a", spec]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        out.append(proc)
+        return proc.returncode == 0 and proc.stdout.strip()
+
+    with tempfile.TemporaryDirectory() as td:
+        lnk = os.path.join(td, "r" + image.suffix)
+        _os.symlink(image, lnk)
+        procs: list = []
+        if _run(lnk, procs):
+            return json.loads(procs[0].stdout)["colors"]
+
+        # fallback: JPEG con ruido (nombre unico => sin colision de stems)
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as tmp:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-i", str(image),
+                 "-vf", "noise=alls=6:allf=t", "-qscale:v", "2", tmp.name],
+                capture_output=True,
+            )
+            if not _run(tmp.name, procs):
+                proc = procs[-1]
+                sys.exit(f"error de recol: {proc.stderr.strip()}")
+            return json.loads(procs[-1].stdout)["colors"]
+
+
+def is_light(colors: dict) -> bool:
+    h = colors["bg"][0].lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b > 128
+
+
+def hex_rgb(h: str) -> tuple[int, int, int]:
+    h = h.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+def rgb_hex(r: int, g: int, b: int) -> str:
+    return f"#{max(r,0)&255:02x}{max(g,0)&255:02x}{max(b,0)&255:02x}"
+
+
+def shade(h: str, factor: float) -> str:
+    r, g, b = hex_rgb(h)
+    return rgb_hex(int(r * factor), int(g * factor), int(b * factor))
+
+
+def hue_sat(h: str) -> tuple[float, float]:
+    r, g, b = (x / 255 for x in hex_rgb(h))
+    mx, mn = max(r, g, b), min(r, g, b)
+    if mx == mn:
+        return -1, 0.0
+    d = mx - mn
+    s = d / mx
+    if mx == r: hd = ((g - b) / d) % 6
+    elif mx == g: hd = (b - r) / d + 2
+    else: hd = (r - g) / d + 4
+    return (hd * 60) % 360, s
+
+
+def hue_dist(a: float, b: float) -> float:
+    if a < 0 or b < 0:
+        return 180.0
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
+
+
+def pick_accents(c: dict) -> tuple[str, str, str]:
+    """Primary/secundario/terciario: ANSI mas cromaticos con hue distinto.
+    Fallback: cursor.bg si la imagen es esencialmente gris."""
+    base = c["base"]
+    seen, scored = set(), []
+    for k in ACCENT_KEYS:
+        h = base[k]
+        if h not in seen:
+            seen.add(h)
+            scored.append(h)
+    scored.sort(key=lambda h: hue_sat(h)[1], reverse=True)
+
+    primario = c["cursor"]["bg"]
+    p_h, p_s = hue_sat(primario)
+    if scored and hue_sat(scored[0])[1] > max(p_s, 0.12):
+        primario = scored[0]
+        p_h, _ = hue_sat(primario)
+
+    pool = [h for h in scored if h != primario]
+    sec = next((h for h in pool if hue_dist(hue_sat(h)[0], p_h) > 40), None)
+    if sec is None:
+        sec = pool[0] if pool else base["cyan"]
+    s_h = hue_sat(sec)[0]
+
+    pool2 = [h for h in pool if h != sec]
+    ter = next((h for h in pool2 if hue_dist(hue_sat(h)[0], p_h) > 40
+                and hue_dist(hue_sat(h)[0], s_h) > 40), None)
+    if ter is None:
+        ter = pool2[0] if pool2 else sec
+    return primario, sec, ter
+
+
+def lum_hex(h: str) -> float:
+    """Luminancia relativa (WCAG) de un hex."""
+    def lin(x):
+        x /= 255.0
+        return x / 12.92 if x <= 0.04045 else ((x + 0.055) / 1.055) ** 2.4
+    r, g, b = hex_rgb(h)
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def contrast(a: str, b: str) -> float:
+    la, lb = lum_hex(a), lum_hex(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def ensure_contrast(fg: str, bg: str, target: float = 3.0) -> str:
+    """Ajusta el fondo (acento) hasta que el par on_x/x alcance el ratio.
+    El fg no se toca: en dark el acento se aclara (fg oscuro encima),
+    en light se oscurece (fg claro encima). Igual que el check de CI
+    (floor 2.0, warn <3.0): apuntamos a >=3.0 para que no haya warnings."""
+    cur = contrast(fg, bg)
+    if cur >= target:
+        return bg
+    factor = 1.06 if lum_hex(fg) < lum_hex(bg) else 0.94
+    for _ in range(60):
+        bg = shade(bg, factor)
+        if contrast(fg, bg) >= target:
+            return bg
+    return bg
+
+
+# Piso de luminancia del fondo dark: evita fondos casi negro en wallpapers
+# oscuros (estilo Cafecito/Noir, ~luma de #171717).
+MIN_DARK_LUM = 0.0085
+
+
+def dark_surface(bg: list) -> str:
+    """Fondo dark: bg[1] (el tono que usaba el shell, mas claro que bg[0]).
+    Si es casi negro se mezcla hacia bg[2] hasta el piso de luminancia.
+    mSurface y terminal.background comparten este mismo color."""
+    s, hi = bg[1], bg[2]
+    l1, l2 = lum_hex(s), lum_hex(hi)
+    if l1 >= MIN_DARK_LUM or l2 <= l1:
+        return s
+    t = min((MIN_DARK_LUM - l1) / (l2 - l1), 0.5)
+    r1, g1, b1 = hex_rgb(s)
+    r2, g2, b2 = hex_rgb(hi)
+    return rgb_hex(int(r1 + (r2 - r1) * t), int(g1 + (g2 - g1) * t),
+                   int(b1 + (b2 - b1) * t))
+
+
+def build_dark(c: dict) -> dict:
+    base, bright = c["base"], c["bright"]
+    bg, fg = c["bg"], c["fg"]
+    primario, secundario, terciario = pick_accents(c)
+    superficie = dark_surface(bg)
+    on = bg[0]  # texto sobre acentos (oscuro en dark)
+    primario = ensure_contrast(on, primario)
+    secundario = ensure_contrast(on, secundario)
+    terciario = ensure_contrast(on, terciario)
+    error = ensure_contrast(on, base["red"])
+    hover = ensure_contrast(fg[0], bg[3])
+    return {
+        "primary": primario, "on_primary": on,
+        "secondary": secundario, "on_secondary": on,
+        "tertiary": terciario, "on_tertiary": on,
+        "error": error, "on_error": on,
+        # surface == terminal.background (fondo identico para terminal)
+        "surface": superficie, "on_surface": fg[0],
+        "surface_container": bg[2], "on_surface_variant": fg[0],
+        "outline_variant": bg[4], "shadow": shade(bg[0], 0.6),
+        "hover": hover, "on_hover": fg[0],
+        "terminal": {
+            "normal": {k: base[k] for k in ANSI},
+            "bright": {k: bright[k] for k in ANSI},
+            "foreground": fg[0], "background": superficie,
+            "selection_fg": bg[0], "selection_bg": primario,
+            "cursor_text": bg[0], "cursor": fg[0],
+        },
+    }
+
+
+def build_light(dark_c: dict, light_c: dict) -> dict:
+    # Superficies y fg: del tema invertido (conserva el tinte del wallpaper)
+    s0, s1, s2, s4 = (light_c["bg"][0], light_c["bg"][1],
+                      light_c["bg"][2], light_c["bg"][4])
+    fg0 = light_c["fg"][0]
+    # Acentos: del tema dark, oscurecidos (convencion Cafecito ~x0.78-0.90)
+    primario, secundario, terciario = pick_accents(dark_c)
+    primario, secundario = shade(primario, 0.9), shade(secundario, 0.85)
+    terciario, error = shade(terciario, 0.85), shade(dark_c["base"]["red"], 0.82)
+    # asegurar on_x legible sobre cada acento (CI: floor 2.0, warn <3.0)
+    primario = ensure_contrast(s0, primario)
+    secundario = ensure_contrast(s0, secundario)
+    terciario = ensure_contrast(s0, terciario)
+    error = ensure_contrast(s0, error)
+    return {
+        "primary": primario, "on_primary": s0,
+        "secondary": secundario, "on_secondary": s0,
+        "tertiary": terciario, "on_tertiary": s0,
+        "error": error, "on_error": s0,
+        "surface": s0, "on_surface": fg0,
+        "surface_container": s1, "on_surface_variant": fg0,
+        "outline_variant": s4, "shadow": shade(s4, 0.7),
+        "hover": ensure_contrast(fg0, s2), "on_hover": fg0,
+        "terminal": {
+            "normal": {k: (s4 if k == "black" else
+                           dark_c["bg"][0] if k == "white" else
+                           shade(dark_c["base"][k], 0.78)) for k in ANSI},
+            "bright": {k: (shade(s4, 0.8) if k == "black" else
+                           shade(dark_c["bg"][0], 0.62) if k == "white" else
+                           shade(dark_c["bright"][k], 0.79)) for k in ANSI},
+            "foreground": fg0, "background": s0,
+            "selection_fg": s0, "selection_bg": primario,
+            "cursor_text": s0, "cursor": fg0,
+        },
+    }
+
+
+FMT1_TO_FMT2 = {
+    "mPrimary": "primary", "mOnPrimary": "on_primary",
+    "mSecondary": "secondary", "mOnSecondary": "on_secondary",
+    "mTertiary": "tertiary", "mOnTertiary": "on_tertiary",
+    "mError": "error", "mOnError": "on_error",
+    "mSurface": "surface", "mOnSurface": "on_surface",
+    "mSurfaceVariant": "surface_container",
+    "mOnSurfaceVariant": "on_surface_variant",
+    "mOutline": "outline_variant", "mShadow": "shadow",
+    "mHover": "hover", "mOnHover": "on_hover",
+    "selectionFg": "selection_fg", "selectionBg": "selection_bg",
+    "cursorText": "cursor_text",
+}
+
+
+def migrate_file(path: Path) -> None:
+    """Formato 1 -> formato 2 (renombres 1:1, sin cambio de colores)."""
+    data = json.loads(path.read_text())
+    if data.get("version") == 2:
+        print(f"ya es formato 2: {path}")
+        return
+    for mode in ("dark", "light"):
+        if mode not in data:
+            continue
+        data[mode] = {FMT1_TO_FMT2.get(k, k): v for k, v in data[mode].items()}
+        term = data[mode].get("terminal")
+        if isinstance(term, dict):
+            data[mode]["terminal"] = {FMT1_TO_FMT2.get(k, k): v
+                                      for k, v in term.items()}
+    data.pop("version", None)
+    data = {"version": 2, **data}
+    path.write_text(json.dumps(data, indent=2) + "\n")
+    print(f"migrada a formato 2: {path}")
+
+
+def main() -> None:
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if "--migrate" in sys.argv:
+        files = args or sorted(PALETTES_DIR.glob("*.json"))
+        for f in files:
+            migrate_file(Path(f).expanduser().resolve())
+        return
+    if not args:
+        sys.exit(__doc__)
+    image = Path(args[0]).expanduser().resolve()
+    if not image.is_file():
+        sys.exit(f"error: no existe {image}")
+
+    nombre = args[1] if len(args) > 1 else image.stem
+    nombre = re.sub(r"[^a-zA-Z0-9 _-]", "", nombre).strip() or "sin-nombre"
+
+    tema_base = recol_theme(image, os.environ.get("NOCTALIA_ADJUST_SPEC") or None)
+    spec = os.environ.get("NOCTALIA_ADJUST_SPEC", "").strip()
+    # corregir tema base y su invertido en paralelo (recol es lo mas lento del pipeline)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_base = pool.submit(recol_theme, image, spec or None)
+        fut_inv = pool.submit(recol_theme, image, "invert=50")
+        tema_base = fut_base.result()
+        tema_inv = fut_inv.result()
+
+    if is_light(tema_base):
+        tema_l = tema_base
+        tema_d = recol_theme(image, "invert=50,brightness=5" + ("," + spec if spec else ""))
+    else:
+        tema_d = tema_base
+        tema_l = tema_inv
+
+    palette = {"version": 2, "dark": build_dark(tema_d), "light": build_light(tema_d, tema_l)}
+    PALETTES_DIR.mkdir(parents=True, exist_ok=True)
+    out = PALETTES_DIR / f"{nombre}.json"
+    out.write_text(json.dumps(palette, indent=2) + "\n")
+    print(f"palette guardado: {out}")
+
+
+if __name__ == "__main__":
+    main()
